@@ -37,4 +37,5 @@ sudo dnf install sdcc
 
 ## License
 
-SDCC is free software under the GPL.
+SDCC is free software under the GPL. The build scripts in this repository are
+released under [MIT-0](LICENSE).
