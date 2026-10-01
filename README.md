@@ -1,5 +1,11 @@
 # sdcc-build
 
+[![Mirror](https://img.shields.io/github/actions/workflow/status/llvm-z80/sdcc-build/mirror.yml?branch=main&label=Mirror&style=flat-square)](https://github.com/llvm-z80/sdcc-build/actions/workflows/mirror.yml)
+[![Build](https://img.shields.io/github/actions/workflow/status/llvm-z80/sdcc-build/build.yml?branch=main&label=Build&style=flat-square)](https://github.com/llvm-z80/sdcc-build/actions/workflows/build.yml)
+[![Repository](https://img.shields.io/github/actions/workflow/status/llvm-z80/sdcc-build/repo.yml?branch=main&label=Repository&style=flat-square)](https://github.com/llvm-z80/sdcc-build/actions/workflows/repo.yml)
+[![Release](https://img.shields.io/github/v/release/llvm-z80/sdcc?display_name=release&style=flat-square)](https://github.com/llvm-z80/sdcc/releases/latest)
+[![License](https://img.shields.io/github/license/llvm-z80/sdcc-build?style=flat-square)](LICENSE)
+
 Mirrors [SDCC](https://sdcc.sourceforge.net/) into
 [llvm-z80/sdcc](https://github.com/llvm-z80/sdcc) and builds packages from it.
 This repository deploys the latest SDCC packages for use in LLVM-Z80 build CI.
