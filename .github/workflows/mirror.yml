@@ -1,0 +1,70 @@
+name: Mirror
+
+# Keeps trunk and the release tags of the mirror in step with SDCC's
+# SourceForge repositories.
+
+on:
+  schedule:
+    # 05:00 in UTC+9.
+    - cron: "0 20 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mirror
+
+env:
+  MIRROR_REPO: llvm-z80/sdcc
+  # Force JS actions onto Node 24 -- Node 20 is deprecated on GHA runners.
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Subversion
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq subversion
+
+      - name: Mirror
+        env:
+          SKIPPED_FILE: ${{ runner.temp }}/skipped
+        run: |
+          git init -q --bare "$RUNNER_TEMP/mirror.git"
+          cd "$RUNNER_TEMP/mirror.git"
+          git remote add origin "https://github.com/$MIRROR_REPO.git"
+          "$GITHUB_WORKSPACE/scripts/mirror.sh"
+
+      # App tokens last an hour, so this one is made after the long import.
+      - uses: actions/create-github-app-token@v3
+        id: token
+        with:
+          client-id: ${{ vars.MIRROR_APP_CLIENT_ID }}
+          private-key: ${{ secrets.MIRROR_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: sdcc
+          permission-contents: write
+
+      # Tags never move on push, so an imported tag that differs from the
+      # mirror's is refused instead of replacing it.
+      - name: Push
+        env:
+          TOKEN: ${{ steps.token.outputs.token }}
+        run: |
+          cd "$RUNNER_TEMP/mirror.git"
+          url="https://x-access-token:$TOKEN@github.com/$MIRROR_REPO.git"
+          git push "$url" refs/heads/trunk:refs/heads/trunk
+          git push "$url" 'refs/tags/sdcc-*:refs/tags/sdcc-*'
+
+      - name: Report skipped tags
+        run: |
+          if [ -s "$RUNNER_TEMP/skipped" ]; then
+            echo "::error::Skipped, to be tried again on the next run: $(paste -sd ' ' "$RUNNER_TEMP/skipped")"
+            exit 1
+          fi

@@ -1,0 +1,72 @@
+name: Repository
+
+# Publishes the packages of the mirror's latest release as signed apt and dnf
+# repositories on GitHub Pages.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pages
+
+env:
+  MIRROR_REPO: llvm-z80/sdcc
+  # Force JS actions onto Node 24 -- Node 20 is deprecated on GHA runners.
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    name: Build repositories
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install repository tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq apt-utils createrepo-c rpm
+
+      - name: Download the latest release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag=$(gh release list --repo "$MIRROR_REPO" --exclude-drafts --exclude-pre-releases \
+            --limit 1 --json tagName --jq '.[0].tagName')
+          echo "Publishing $tag"
+          gh release download "$tag" --repo "$MIRROR_REPO" -p '*.deb' -p '*.rpm' -D packages
+
+      - name: Import the signing key
+        env:
+          REPO_SIGNING_KEY: ${{ secrets.REPO_SIGNING_KEY }}
+        run: |
+          gpg --batch --import <<< "$REPO_SIGNING_KEY"
+          fpr=$(gpg --list-secret-keys --with-colons | awk -F: '$1 == "fpr" && !found { print $10; found = 1 }')
+          echo "GPG_KEY_ID=$fpr" >> "$GITHUB_ENV"
+
+      - name: Build
+        run: scripts/make-repo.sh packages site "https://${GITHUB_REPOSITORY_OWNER,,}.github.io/${GITHUB_REPOSITORY#*/}"
+
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: site
+
+  deploy:
+    name: Deploy
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v5

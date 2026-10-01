@@ -1,0 +1,321 @@
+name: Build
+
+# Builds SDCC for each host from trunk or a release tag of the mirror. With
+# publish set, the packages are attached to the mirror's GitHub Release of that
+# tag.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "trunk or a release tag (e.g. sdcc-4.6.0)"
+        required: true
+        default: trunk
+      revision:
+        description: "Debian revision, bumped when the same source is packaged again"
+        required: true
+        default: "1"
+      publish:
+        description: "Attach the packages to the GitHub Release of the tag"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  MIRROR_REPO: llvm-z80/sdcc
+  # Force JS actions onto Node 24 -- Node 20 is deprecated on GHA runners.
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  prepare:
+    name: Resolve ref
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.vars.outputs.sha }}
+      name: ${{ steps.vars.outputs.name }}
+      version: ${{ steps.vars.outputs.version }}
+      changelog-rev: ${{ steps.vars.outputs.changelog-rev }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ env.MIRROR_REPO }}
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+
+      - id: vars
+        env:
+          REF: ${{ inputs.ref }}
+          REVISION: ${{ inputs.revision }}
+          PUBLISH: ${{ inputs.publish }}
+        run: |
+          svn_rev() { sed -nE 's/.*@([0-9]+) .*/\1/p'; }
+          if [[ $REF =~ ^sdcc-([0-9.]+)(-(rc[0-9]+))?$ ]]; then
+            name=$REF
+            version=${BASH_REMATCH[1]}${BASH_REMATCH[3]:+~${BASH_REMATCH[3]}}
+            changelog_rev=
+          elif [ "$PUBLISH" = true ]; then
+            echo "::error::publish needs a release tag, not '$REF'"
+            exit 1
+          else
+            rev=$(git log -1 --format='%(trailers:key=git-svn-id,valueonly)' | svn_rev)
+            name=sdcc-${REF//\//-}-r$rev
+            version=$(cat .version)~r$rev
+            # The last trunk commit to change ChangeLog is what SVN would put
+            # in its $Revision$.
+            changelog_rev=$(git log -1 --first-parent --format='%(trailers:key=git-svn-id,valueonly)' -- ChangeLog | svn_rev)
+          fi
+          {
+            echo "sha=$(git rev-parse HEAD)"
+            echo "name=$name"
+            echo "version=$version"
+            echo "changelog-rev=$changelog_rev"
+          } >> "$GITHUB_OUTPUT"
+          echo "Building $name ($version-$REVISION)"
+
+  build:
+    name: Build ${{ matrix.platform }}
+    needs: prepare
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The oldest supported Ubuntu keeps the packages running on older
+          # distributions.
+          - platform: x86_64-linux
+            os: ubuntu-22.04
+          - platform: aarch64-linux
+            os: ubuntu-22.04-arm
+          # The device libraries do not depend on the host, so macOS and
+          # Windows take them from the x86_64-linux build.
+          - platform: arm64-macos
+            os: macos-14
+            configure: --disable-device-lib
+          - platform: x86_64-windows
+            os: windows-2022
+            configure: --disable-device-lib LDFLAGS=-static
+            shell: msys2 {0}
+    defaults:
+      run:
+        shell: ${{ matrix.shell || 'bash' }}
+    steps:
+      - name: Keep line endings as committed
+        if: runner.os == 'Windows'
+        shell: bash
+        run: git config --global core.autocrlf false
+
+      - uses: actions/checkout@v7
+        with:
+          path: ci
+
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ env.MIRROR_REPO }}
+          ref: ${{ needs.prepare.outputs.sha }}
+          path: src
+          persist-credentials: false
+
+      - name: Install build dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq bison flex gputils rpm texinfo zlib1g-dev
+
+      # SDCC refuses Boost before 1.79, which is newer than Ubuntu 22.04's.
+      - name: Fetch Boost headers (Linux)
+        if: runner.os == 'Linux'
+        env:
+          BOOST: boost-1.92.0
+          BOOST_SHA256: ea7b982002cc9dfbe59b0b217b206f470dc75f3de0bb2973d844118934d82411
+        run: |
+          cd "$RUNNER_TEMP"
+          curl -fsSL --retry 5 -o boost.tar.xz \
+            "https://github.com/boostorg/boost/releases/download/$BOOST/$BOOST-b2-nodocs.tar.xz"
+          echo "$BOOST_SHA256  boost.tar.xz" | sha256sum -c -
+          tar -xf boost.tar.xz "$BOOST/boost"
+          echo "CPPFLAGS=-I$RUNNER_TEMP/$BOOST" >> "$GITHUB_ENV"
+
+      - name: Install build dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install bison flex boost texinfo
+          # Homebrew keeps its bison and flex off PATH.
+          echo "$(brew --prefix bison)/bin" >> "$GITHUB_PATH"
+          echo "$(brew --prefix flex)/bin" >> "$GITHUB_PATH"
+          echo "CPPFLAGS=-I$(brew --prefix)/include" >> "$GITHUB_ENV"
+          echo "MACOSX_DEPLOYMENT_TARGET=11.0" >> "$GITHUB_ENV"
+
+      - uses: msys2/setup-msys2@v2
+        if: runner.os == 'Windows'
+        with:
+          msystem: UCRT64
+          install: >-
+            make bison flex texinfo
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-boost
+            mingw-w64-ucrt-x86_64-zlib
+
+      - name: Build
+        env:
+          CHANGELOG_REV: ${{ needs.prepare.outputs.changelog-rev }}
+          CONFIGURE: ${{ matrix.configure }}
+        run: ci/scripts/build.sh src stage $CONFIGURE
+
+      - name: Smoke test
+        env:
+          CONFIGURE: ${{ matrix.configure }}
+        run: |
+          set -euo pipefail
+          printf 'int main(void) { return 0; }\n' > smoke.c
+          # Linking needs the device libraries.
+          compile_only=
+          if [[ $CONFIGURE == *--disable-device-lib* ]]; then
+            compile_only=-c
+          fi
+          export PATH="$PWD/stage/usr/bin:$PATH"
+          for port in z80 sm83 mcs51 hc08 stm8 mos6502 pdk14 f8; do
+            sdcc -m$port $compile_only smoke.c
+          done
+
+      - name: List the install
+        if: failure()
+        run: find stage -type f | sort || true
+
+      - name: Package (Linux)
+        if: runner.os == 'Linux'
+        env:
+          NAME: ${{ needs.prepare.outputs.name }}
+          PLATFORM: ${{ matrix.platform }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          REVISION: ${{ inputs.revision }}
+          DEB_MAINTAINER: "${{ github.actor }} <${{ github.actor_id }}+${{ github.actor }}@users.noreply.github.com>"
+        run: |
+          mkdir -p out
+          ci/scripts/package-deb.sh stage "$VERSION-$REVISION" out
+          ci/scripts/package-rpm.sh stage "$VERSION" "$REVISION" out
+          mv stage/usr "$NAME"
+          tar -cJf "out/$NAME-$PLATFORM.tar.xz" "$NAME"
+
+      - name: Install the .deb
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get install -y -qq ./out/sdcc_*.deb
+          sdcc -mz80 smoke.c
+
+      # AlmaLinux 9 has the oldest glibc the .rpm is meant for.
+      - name: Install the .rpm
+        if: runner.os == 'Linux'
+        run: |
+          docker run --rm -v "$PWD:/w" -w /w almalinux:9 \
+            sh -c 'dnf install -y -q ./out/sdcc-*.rpm && sdcc -mz80 smoke.c'
+
+      - uses: actions/upload-artifact@v7
+        if: runner.os == 'Linux'
+        with:
+          name: packages-${{ matrix.platform }}
+          path: out/
+          retention-days: 7
+
+      # A tarball keeps the file modes that an artifact upload drops.
+      - name: Stage for packaging
+        if: runner.os != 'Linux'
+        run: tar -cf stage.tar -C stage/usr .
+
+      - uses: actions/upload-artifact@v7
+        if: runner.os != 'Linux'
+        with:
+          name: stage-${{ matrix.platform }}
+          path: stage.tar
+          retention-days: 7
+
+  package:
+    name: Package
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+
+      - name: Assemble packages
+        env:
+          NAME: ${{ needs.prepare.outputs.name }}
+        run: |
+          mkdir -p out libs
+          cp artifacts/packages-*/* out/
+          tar -xf "out/$NAME-x86_64-linux.tar.xz" -C libs
+          for dir in artifacts/stage-*; do
+            platform=${dir#artifacts/stage-}
+            mkdir -p "$NAME/share"
+            tar -xf "$dir/stage.tar" -C "$NAME"
+            rm -rf "$NAME/share/sdcc"
+            cp -R "libs/$NAME/share/sdcc" "$NAME/share/"
+            case $platform in
+              *-windows) zip -qr "out/$NAME-$platform.zip" "$NAME" ;;
+              *) tar -cJf "out/$NAME-$platform.tar.xz" "$NAME" ;;
+            esac
+            rm -rf "$NAME"
+          done
+          cd out
+          sha256sum * > sha256sums.txt
+          cat sha256sums.txt
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: packages
+          path: out/
+          retention-days: 30
+
+  release:
+    name: Publish
+    needs: [prepare, package]
+    if: inputs.publish
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: packages
+          path: out
+
+      - uses: actions/create-github-app-token@v3
+        id: token
+        with:
+          client-id: ${{ vars.MIRROR_APP_CLIENT_ID }}
+          private-key: ${{ secrets.MIRROR_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: sdcc
+          permission-contents: write
+
+      - name: Attach to the release
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+          TAG: ${{ needs.prepare.outputs.name }}
+        run: |
+          if gh release view "$TAG" --repo "$MIRROR_REPO" > /dev/null 2>&1; then
+            gh release upload "$TAG" out/* --repo "$MIRROR_REPO" --clobber
+          else
+            prerelease=
+            if [[ $TAG == *-rc* ]]; then
+              prerelease=--prerelease
+            fi
+            gh release create "$TAG" out/* --repo "$MIRROR_REPO" \
+              --verify-tag $prerelease \
+              --title "SDCC ${TAG#sdcc-}" \
+              --notes "SDCC ${TAG#sdcc-} built from the unmodified SVN tag tags/$TAG/sdcc."
+          fi
+
+      # The release lives in the mirror, so its events never reach this repository.
+      - name: Update the package repositories
+        if: ${{ !contains(needs.prepare.outputs.name, '-rc') }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run repo.yml --repo "$GITHUB_REPOSITORY" --ref main
